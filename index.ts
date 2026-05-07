@@ -1,4 +1,7 @@
 import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { copyToClipboard, CustomEditor, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 
@@ -30,6 +33,10 @@ type EditorSnapshot = {
 	cursor: Cursor;
 };
 
+type PowerlineMode = "auto" | "on" | "off";
+
+const VIM_STATUS_KEY = "vim-mode";
+
 type ReplaceSessionEdit = {
 	start: number;
 	inserted: string;
@@ -55,6 +62,24 @@ function formatTokens(count: number): string {
 	if (count < 1000000) return `${Math.round(count / 1000)}k`;
 	if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
 	return `${Math.round(count / 1000000)}M`;
+}
+
+function getModeLabel(mode: Mode): string {
+	return mode === "insert"
+		? "-- INSERT --"
+		: mode === "replace"
+			? "-- REPLACE --"
+			: mode === "visual"
+				? "-- VISUAL --"
+				: mode === "visual-line"
+					? "-- VISUAL LINE --"
+					: "-- NORMAL --";
+}
+
+function getVimStatusText(mode: Mode, pendingStatus: string): string | undefined {
+	if (mode === "normal") return undefined;
+	const suffix = pendingStatus ? ` ${pendingStatus}..` : "";
+	return `${getModeLabel(mode)}${suffix}`;
 }
 
 function isWord(char: string | undefined): boolean {
@@ -91,6 +116,34 @@ function readSystemClipboardText(): string | undefined {
 		if (text !== undefined) return text;
 	}
 	return undefined;
+}
+
+function readJsonObject(path: string): Record<string, unknown> | undefined {
+	if (!existsSync(path)) return undefined;
+	try {
+		const parsed = JSON.parse(readFileSync(path, "utf8"));
+		return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function hasVimPowerlineConfig(settings: Record<string, unknown> | undefined): boolean {
+	const powerline = settings?.powerline;
+	if (!powerline || typeof powerline !== "object" || Array.isArray(powerline)) return false;
+	const config = powerline as Record<string, unknown>;
+	if (config.vim === true || config.vimMode === true) return true;
+	const customItems = config.customItems;
+	return Array.isArray(customItems) && customItems.some((item) => {
+		if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+		const customItem = item as Record<string, unknown>;
+		return customItem.id === VIM_STATUS_KEY || customItem.statusKey === VIM_STATUS_KEY;
+	});
+}
+
+function isVimPowerlineConfigured(cwd: string): boolean {
+	return hasVimPowerlineConfig(readJsonObject(join(homedir(), ".pi", "agent", "settings.json"))) ||
+		hasVimPowerlineConfig(readJsonObject(join(cwd, ".pi", "settings.json")));
 }
 
 function isBigWord(char: string | undefined): boolean {
@@ -1653,18 +1706,57 @@ export default function (pi: ExtensionAPI) {
 	let mode: Mode = "insert";
 	let pendingStatus = "";
 	let enabled = true;
+	let ownsFooter = false;
+	let ownsEditor = false;
+	let applyGeneration = 0;
+	let powerlineMode: PowerlineMode = (process.env.PI_VIM_POWERLINE === "1" || process.env.PI_VIM_POWERLINE === "true")
+		? "on"
+		: (process.env.PI_VIM_POWERLINE === "0" || process.env.PI_VIM_POWERLINE === "false")
+			? "off"
+			: "auto";
+
+	const isPowerlineAvailable = (ctx: ExtensionContext): boolean => {
+		if (powerlineMode === "on") return true;
+		if (powerlineMode === "off") return false;
+		try {
+			return pi.getCommands().some((command) => command.name === "powerline") && isVimPowerlineConfigured(ctx.cwd);
+		} catch {
+			return false;
+		}
+	};
+
+	const publishVimStatus = (ctx: ExtensionContext, usePowerline: boolean): void => {
+		ctx.ui.setStatus(VIM_STATUS_KEY, usePowerline ? getVimStatusText(mode, pendingStatus) : undefined);
+	};
 
 	const applyVimMode = (ctx: ExtensionContext): void => {
+		const generation = ++applyGeneration;
 		mode = "insert";
 		pendingStatus = "";
+		const usePowerline = isPowerlineAvailable(ctx);
+		publishVimStatus(ctx, usePowerline);
 
 		if (!enabled) {
-			ctx.ui.setFooter(undefined);
-			ctx.ui.setEditorComponent(undefined);
+			ctx.ui.setStatus(VIM_STATUS_KEY, undefined);
+			if (ownsFooter) {
+				ctx.ui.setFooter(undefined);
+				ownsFooter = false;
+			}
+			if (ownsEditor) {
+				ctx.ui.setEditorComponent(undefined);
+				ownsEditor = false;
+			}
 			return;
 		}
 
-		ctx.ui.setFooter((tui, theme, footerData) => {
+		if (usePowerline) {
+			if (ownsFooter) {
+				ctx.ui.setFooter(undefined);
+				ownsFooter = false;
+			}
+		} else {
+			ctx.ui.setStatus(VIM_STATUS_KEY, undefined);
+			ctx.ui.setFooter((tui, theme, footerData) => {
 			const unsubscribe = footerData.onBranchChange(() => tui.requestRender());
 
 			return {
@@ -1783,8 +1875,9 @@ export default function (pi: ExtensionAPI) {
 					const lines = [pwdLine, dimStatsLeft + coloredMiddle + theme.fg("dim", right)];
 
 					const extensionStatuses = footerData.getExtensionStatuses();
-					if (extensionStatuses.size > 0) {
-						const statusLine = Array.from(extensionStatuses.entries())
+					const visibleExtensionStatuses = Array.from(extensionStatuses.entries()).filter(([key]) => key !== VIM_STATUS_KEY);
+					if (visibleExtensionStatuses.length > 0) {
+						const statusLine = visibleExtensionStatuses
 							.sort(([a], [b]) => a.localeCompare(b))
 							.map(([, text]) => sanitizeStatusText(text))
 							.join(" ");
@@ -1794,29 +1887,55 @@ export default function (pi: ExtensionAPI) {
 					return lines;
 				},
 			};
-		});
+			});
+			ownsFooter = true;
+		}
 
-		ctx.ui.setEditorComponent(
-			(tui, theme, keybindings) =>
-				new VimModeEditor(
-					tui,
-					theme,
-					keybindings,
-					(nextMode, nextPending) => {
-						mode = nextMode;
-						pendingStatus = nextPending;
-					},
-					(text) => {
-						void copyToClipboard(text).catch(() => {});
-					},
-					() => readSystemClipboardText(),
-				),
-		);
+		const installEditor = () => {
+			if (generation !== applyGeneration || !enabled) return;
+			ctx.ui.setEditorComponent(
+				(tui, theme, keybindings) =>
+					new VimModeEditor(
+						tui,
+						theme,
+						keybindings,
+						(nextMode, nextPending) => {
+							mode = nextMode;
+							pendingStatus = nextPending;
+							publishVimStatus(ctx, usePowerline);
+						},
+						(text) => {
+							void copyToClipboard(text).catch(() => {});
+						},
+						() => readSystemClipboardText(),
+					),
+			);
+			ownsEditor = true;
+		};
+
+		if (usePowerline) {
+			setTimeout(installEditor, 0);
+		} else {
+			installEditor();
+		}
 	};
 
 	pi.registerCommand("vim-mode", {
-		description: "Toggle vim mode",
-		handler: async (_args, ctx) => {
+		description: "Toggle vim mode. Use /vim-mode powerline auto|on|off to control pi-powerline integration.",
+		handler: async (args, ctx) => {
+			const parts = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
+			if (parts[0] === "powerline") {
+				const nextMode = parts[1] as PowerlineMode | undefined;
+				if (nextMode !== "auto" && nextMode !== "on" && nextMode !== "off") {
+					ctx.ui.notify("Usage: /vim-mode powerline auto|on|off", "warning");
+					return;
+				}
+				powerlineMode = nextMode;
+				applyVimMode(ctx);
+				ctx.ui.notify(`Vim powerline integration ${powerlineMode}.`, "info");
+				return;
+			}
+
 			enabled = !enabled;
 			applyVimMode(ctx);
 			ctx.ui.notify(`Vim mode ${enabled ? "enabled" : "disabled"}.`, "info");
