@@ -36,6 +36,7 @@ type EditorSnapshot = {
 type PowerlineMode = "auto" | "on" | "off";
 
 const VIM_STATUS_KEY = "vim-mode";
+const VIM_PENDING_STATUS_KEY = "vim-pending";
 
 type ReplaceSessionEdit = {
 	start: number;
@@ -76,10 +77,12 @@ function getModeLabel(mode: Mode): string {
 					: "-- NORMAL --";
 }
 
-function getVimStatusText(mode: Mode, pendingStatus: string): string | undefined {
-	if (mode === "normal") return undefined;
-	const suffix = pendingStatus ? ` ${pendingStatus}..` : "";
-	return `${getModeLabel(mode)}${suffix}`;
+function getVimModeStatusText(mode: Mode): string | undefined {
+	return mode === "normal" ? undefined : getModeLabel(mode);
+}
+
+function getVimPendingStatusText(pendingStatus: string): string | undefined {
+	return pendingStatus ? `${pendingStatus}..` : undefined;
 }
 
 function isWord(char: string | undefined): boolean {
@@ -1726,7 +1729,8 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const publishVimStatus = (ctx: ExtensionContext, usePowerline: boolean): void => {
-		ctx.ui.setStatus(VIM_STATUS_KEY, usePowerline ? getVimStatusText(mode, pendingStatus) : undefined);
+		ctx.ui.setStatus(VIM_STATUS_KEY, usePowerline ? getVimModeStatusText(mode) : undefined);
+		ctx.ui.setStatus(VIM_PENDING_STATUS_KEY, usePowerline ? getVimPendingStatusText(pendingStatus) : undefined);
 	};
 
 	const applyVimMode = (ctx: ExtensionContext): void => {
@@ -1738,6 +1742,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (!enabled) {
 			ctx.ui.setStatus(VIM_STATUS_KEY, undefined);
+			ctx.ui.setStatus(VIM_PENDING_STATUS_KEY, undefined);
 			if (ownsFooter) {
 				ctx.ui.setFooter(undefined);
 				ownsFooter = false;
@@ -1756,6 +1761,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		} else {
 			ctx.ui.setStatus(VIM_STATUS_KEY, undefined);
+			ctx.ui.setStatus(VIM_PENDING_STATUS_KEY, undefined);
 			ctx.ui.setFooter((tui, theme, footerData) => {
 			const unsubscribe = footerData.onBranchChange(() => tui.requestRender());
 
@@ -1875,7 +1881,7 @@ export default function (pi: ExtensionAPI) {
 					const lines = [pwdLine, dimStatsLeft + coloredMiddle + theme.fg("dim", right)];
 
 					const extensionStatuses = footerData.getExtensionStatuses();
-					const visibleExtensionStatuses = Array.from(extensionStatuses.entries()).filter(([key]) => key !== VIM_STATUS_KEY);
+					const visibleExtensionStatuses = Array.from(extensionStatuses.entries()).filter(([key]) => key !== VIM_STATUS_KEY && key !== VIM_PENDING_STATUS_KEY);
 					if (visibleExtensionStatuses.length > 0) {
 						const statusLine = visibleExtensionStatuses
 							.sort(([a], [b]) => a.localeCompare(b))
