@@ -1804,9 +1804,9 @@ export default function (pi: ExtensionAPI) {
 
 					const prefix =
 						mode === "insert"
-							? theme.fg("muted", "-- INSERT -- ")
+							? theme.fg("accent", "-- INSERT -- ")
 							: mode === "replace"
-								? theme.fg("muted", "-- REPLACE -- ")
+								? theme.fg("accent", "-- REPLACE -- ")
 								: mode === "visual"
 									? theme.fg("accent", "-- VISUAL -- ")
 									: mode === "visual-line"
