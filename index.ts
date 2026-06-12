@@ -269,6 +269,19 @@ function replaceRange(text: string, start: number, end: number, replacement = ""
 	return text.slice(0, start) + replacement + text.slice(end);
 }
 
+function printableSingleGrapheme(data: string): string | undefined {
+	if (!data) return undefined;
+	let result: string | undefined;
+	let count = 0;
+	for (const segment of graphemeSegmenter.segment(data)) {
+		result = segment.segment;
+		count++;
+		if (count > 1) return undefined;
+	}
+	if (!result || /[\p{Cc}\p{Cs}]/u.test(result)) return undefined;
+	return result;
+}
+
 class VimModeEditor extends CustomEditor {
 	private mode: Mode = "insert";
 	private pending: Pending;
@@ -749,15 +762,17 @@ class VimModeEditor extends CustomEditor {
 		this.edit((text, offset) => {
 			if (offset >= lineEnd(text, offset)) return undefined;
 			let end = offset;
+			let replaced = 0;
 			for (let i = 0; i < count; i++) {
 				end = nextGraphemeOffset(text, end);
 				if (end > lineEnd(text, offset)) {
 					end = lineEnd(text, offset);
 					break;
 				}
+				replaced++;
 			}
 			return {
-				text: replaceRange(text, offset, end, char.repeat(Math.max(1, count))),
+				text: replaceRange(text, offset, end, char.repeat(Math.max(1, replaced))),
 				cursorOffset: offset,
 			};
 		});
@@ -1229,8 +1244,9 @@ class VimModeEditor extends CustomEditor {
 
 		switch (this.pending) {
 			case "r": {
-				if (data.length === 1 && data.charCodeAt(0) >= 32) {
-					this.replaceUnderCursor(data, this.takeCount(1));
+				const char = printableSingleGrapheme(data);
+				if (char) {
+					this.replaceUnderCursor(char, this.takeCount(1));
 					return true;
 				}
 				break;
@@ -1574,6 +1590,7 @@ class VimModeEditor extends CustomEditor {
 				return;
 			case "r":
 				this.pending = "r";
+				this.emitStatus();
 				return;
 			case "R":
 				this.enterReplace();
