@@ -600,6 +600,7 @@ class VimModeEditor extends CustomEditor {
 			this.setMode("normal");
 			return;
 		}
+		this.writeYank(selected, range.linewise ? "line" : "char");
 		this.edit(() => ({
 			text: replaceRange(text, range.start, range.end),
 			cursorOffset: range.start,
@@ -843,6 +844,7 @@ class VimModeEditor extends CustomEditor {
 			if (offset > end) return undefined;
 			const deleteEnd = offset === end && end < text.length ? end + 1 : end;
 			if (deleteEnd <= offset) return undefined;
+			this.writeYank(text.slice(offset, deleteEnd), "char");
 			return {
 				text: replaceRange(text, offset, deleteEnd),
 				cursorOffset: offset,
@@ -856,6 +858,7 @@ class VimModeEditor extends CustomEditor {
 		this.edit((text, offset) => {
 			if (offset >= lineEnd(text, offset)) return undefined;
 			const end = nextGraphemeOffset(text, offset);
+			this.writeYank(text.slice(offset, end), "char");
 			return {
 				text: replaceRange(text, offset, end),
 				cursorOffset: offset,
@@ -897,6 +900,7 @@ class VimModeEditor extends CustomEditor {
 					break;
 				}
 			}
+			this.writeYank(text.slice(offset, end), "char");
 			return {
 				text: replaceRange(text, offset, end),
 				cursorOffset: offset,
@@ -917,6 +921,7 @@ class VimModeEditor extends CustomEditor {
 			this.moveToOffset(start <= end ? from : Math.max(from, to - 1));
 			return;
 		}
+		this.writeYank(selected, "char");
 		this.edit(() => ({
 			text: replaceRange(text, from, to),
 			cursorOffset: from,
@@ -949,6 +954,7 @@ class VimModeEditor extends CustomEditor {
 		this.edit((text, offset) => {
 			if (text.length === 0) return undefined;
 			const { start, end } = this.lineBlockRange(count, direction);
+			this.writeYank(text.slice(start, end), "line");
 			const nextText = replaceRange(text, start, end);
 			return {
 				text: nextText,
@@ -1294,10 +1300,10 @@ class VimModeEditor extends CustomEditor {
 					const pending = this.pending;
 					this.clearPending();
 					const selected = this.getCurrentText().slice(start, end);
-					if (pending === "y") this.writeYank(selected, "line");
+					this.writeYank(selected, "line");
 					if (pending === "y") return true;
 					this.edit(() => ({ text: replaceRange(this.getCurrentText(), start, end), cursorOffset: start }));
-					if (this.pending === "c") this.setMode("insert");
+					if (pending === "c") this.setMode("insert");
 					return true;
 				}
 				if (data === "j") {
