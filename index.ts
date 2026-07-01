@@ -2,8 +2,8 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { copyToClipboard, CustomEditor, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { Key, matchesKey, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { copyToClipboard, CustomEditor, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 type Mode = "normal" | "insert" | "replace" | "visual" | "visual-line";
 type Pending = "d" | "c" | "y" | "f" | "F" | "t" | "T" | "r" | undefined;
@@ -325,6 +325,19 @@ function replaceRange(text: string, start: number, end: number, replacement = ""
 	return text.slice(0, start) + replacement + text.slice(end);
 }
 
+function printableSingleGrapheme(data: string): string | undefined {
+	if (!data) return undefined;
+	let result: string | undefined;
+	let count = 0;
+	for (const segment of graphemeSegmenter.segment(data)) {
+		result = segment.segment;
+		count++;
+		if (count > 1) return undefined;
+	}
+	if (!result || /[\p{Cc}\p{Cs}]/u.test(result)) return undefined;
+	return result;
+}
+
 class VimModeEditor extends CustomEditor {
 	private mode: Mode = "insert";
 	private pending: Pending;
@@ -386,10 +399,13 @@ class VimModeEditor extends CustomEditor {
 		this.writeCursorShape("\x1b[2 q");
 	}
 
+	private usesHardwareCursor(): boolean {
+		return this.mode === "normal" || this.mode === "insert" || this.mode === "replace";
+	}
+
 	private updateCursorStyle(): void {
-		const textEntry = this.mode === "insert" || this.mode === "replace";
-		const sequence = this.mode === "replace" ? "\x1b[3 q" : textEntry ? "\x1b[5 q" : "\x1b[2 q";
-		(this.tui as unknown as { setShowHardwareCursor(enabled: boolean): void }).setShowHardwareCursor(textEntry);
+		const sequence = this.mode === "replace" ? "\x1b[3 q" : this.mode === "insert" ? "\x1b[5 q" : "\x1b[2 q";
+		(this.tui as unknown as { setShowHardwareCursor(enabled: boolean): void }).setShowHardwareCursor(this.usesHardwareCursor());
 		this.writeCursorShape(sequence);
 		setTimeout(() => this.writeCursorShape(sequence), 0);
 	}
@@ -643,6 +659,7 @@ class VimModeEditor extends CustomEditor {
 			this.setMode("normal");
 			return;
 		}
+		this.writeYank(selected, range.linewise ? "line" : "char");
 		this.edit(() => ({
 			text: replaceRange(text, range.start, range.end),
 			cursorOffset: range.start,
@@ -805,15 +822,17 @@ class VimModeEditor extends CustomEditor {
 		this.edit((text, offset) => {
 			if (offset >= lineEnd(text, offset)) return undefined;
 			let end = offset;
+			let replaced = 0;
 			for (let i = 0; i < count; i++) {
 				end = nextGraphemeOffset(text, end);
 				if (end > lineEnd(text, offset)) {
 					end = lineEnd(text, offset);
 					break;
 				}
+				replaced++;
 			}
 			return {
-				text: replaceRange(text, offset, end, char.repeat(Math.max(1, count))),
+				text: replaceRange(text, offset, end, char.repeat(Math.max(1, replaced))),
 				cursorOffset: offset,
 			};
 		});
@@ -884,6 +903,7 @@ class VimModeEditor extends CustomEditor {
 			if (offset > end) return undefined;
 			const deleteEnd = offset === end && end < text.length ? end + 1 : end;
 			if (deleteEnd <= offset) return undefined;
+			this.writeYank(text.slice(offset, deleteEnd), "char");
 			return {
 				text: replaceRange(text, offset, deleteEnd),
 				cursorOffset: offset,
@@ -897,6 +917,7 @@ class VimModeEditor extends CustomEditor {
 		this.edit((text, offset) => {
 			if (offset >= lineEnd(text, offset)) return undefined;
 			const end = nextGraphemeOffset(text, offset);
+			this.writeYank(text.slice(offset, end), "char");
 			return {
 				text: replaceRange(text, offset, end),
 				cursorOffset: offset,
@@ -938,6 +959,7 @@ class VimModeEditor extends CustomEditor {
 					break;
 				}
 			}
+			this.writeYank(text.slice(offset, end), "char");
 			return {
 				text: replaceRange(text, offset, end),
 				cursorOffset: offset,
@@ -958,6 +980,7 @@ class VimModeEditor extends CustomEditor {
 			this.moveToOffset(start <= end ? from : Math.max(from, to - 1));
 			return;
 		}
+		this.writeYank(selected, "char");
 		this.edit(() => ({
 			text: replaceRange(text, from, to),
 			cursorOffset: from,
@@ -990,6 +1013,7 @@ class VimModeEditor extends CustomEditor {
 		this.edit((text, offset) => {
 			if (text.length === 0) return undefined;
 			const { start, end } = this.lineBlockRange(count, direction);
+			this.writeYank(text.slice(start, end), "line");
 			const nextText = replaceRange(text, start, end);
 			return {
 				text: nextText,
@@ -1131,11 +1155,11 @@ class VimModeEditor extends CustomEditor {
 		const range = this.getVisualRange() ?? this.flashRange;
 		if (!range) {
 			const lines = super.render(width);
-			if (this.mode !== "insert") return lines;
+			if (!this.usesHardwareCursor()) return lines;
 			return lines.map((line) =>
 				line
-					.replace(/\x1b_pi:c\x07\x1b\[7m \x1b\[0m/g, "\x1b_pi:c\x07")
-					.replace(/\x1b_pi:c\x07\x1b\[7m([\s\S])\x1b\[0m/g, "\x1b_pi:c\x07$1"),
+					.replace(/(\x1b_pi:c\x07)?\x1b\[7m \x1b\[0m/g, "$1")
+					.replace(/(\x1b_pi:c\x07)?\x1b\[7m([\s\S])\x1b\[0m/g, "$1$2"),
 			);
 		}
 
@@ -1285,8 +1309,9 @@ class VimModeEditor extends CustomEditor {
 
 		switch (this.pending) {
 			case "r": {
-				if (data.length === 1 && data.charCodeAt(0) >= 32) {
-					this.replaceUnderCursor(data, this.takeCount(1));
+				const char = printableSingleGrapheme(data);
+				if (char) {
+					this.replaceUnderCursor(char, this.takeCount(1));
 					return true;
 				}
 				break;
@@ -1334,10 +1359,10 @@ class VimModeEditor extends CustomEditor {
 					const pending = this.pending;
 					this.clearPending();
 					const selected = this.getCurrentText().slice(start, end);
-					if (pending === "y") this.writeYank(selected, "line");
+					this.writeYank(selected, "line");
 					if (pending === "y") return true;
 					this.edit(() => ({ text: replaceRange(this.getCurrentText(), start, end), cursorOffset: start }));
-					if (this.pending === "c") this.setMode("insert");
+					if (pending === "c") this.setMode("insert");
 					return true;
 				}
 				if (data === "j") {
@@ -1630,6 +1655,7 @@ class VimModeEditor extends CustomEditor {
 				return;
 			case "r":
 				this.pending = "r";
+				this.emitStatus();
 				return;
 			case "R":
 				this.enterReplace();
