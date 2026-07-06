@@ -738,12 +738,16 @@ export class VimModeEditor extends CustomEditor {
 		this.clearPending();
 		this.edit((text, offset) => {
 			if (text.length === 0) return undefined;
-			const { start, end } = this.lineBlockRange(count, direction);
+			let { start, end } = this.lineBlockRange(count, direction);
 			this.writeYank(text.slice(start, end), "line");
+			// When deleting at the end of text, consume the preceding newline
+			if (end >= text.length && start > 0 && text[start - 1] === "\n") {
+				start -= 1;
+			}
 			const nextText = replaceRange(text, start, end);
 			return {
 				text: nextText,
-				cursorOffset: Math.min(start, nextText.length),
+				cursorOffset: Math.min(start, Math.max(0, nextText.length - 1)),
 			};
 		});
 	}
