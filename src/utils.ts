@@ -1,9 +1,5 @@
 /**
- * Re-exports pure utility functions from index.ts for unit testing.
- *
- * These functions will eventually be extracted into their own modules
- * during refactoring. For now, we duplicate the pure logic here so
- * we can lock in behavior with tests before restructuring.
+ * Pure utility functions used by the vim mode editor.
  */
 
 // --- Utility ---

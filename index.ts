@@ -1,11 +1,39 @@
-import { execFileSync } from "node:child_process";
 import { copyToClipboard, CustomEditor, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import {
+	clamp,
+	cursorToOffset,
+	firstNonWhitespace,
+	isBlankLine,
+	isBigWord,
+	isWord,
+	lineEnd,
+	lineLast,
+	lineStart,
+	moveDown,
+	moveUp,
+	nextGraphemeOffset,
+	nextLineStart,
+	nextWordStart,
+	offsetToCursor,
+	paragraphBackward,
+	paragraphForward,
+	prevGraphemeOffset,
+	prevLineStart,
+	prevWordStart,
+	printableSingleGrapheme,
+	replaceRange,
+	sanitizeStatusText,
+	totalLength,
+	wordEnd,
+	formatTokens,
+	type Cursor,
+} from "./src/utils.ts";
+import { readSystemClipboardText } from "./src/clipboard.ts";
 
 type Mode = "normal" | "insert" | "replace" | "visual" | "visual-line";
 type Pending = "d" | "c" | "y" | "f" | "F" | "t" | "T" | "r" | undefined;
 type LastFind = { char: string; forward: boolean; till: boolean } | undefined;
-type Cursor = { line: number; col: number };
 type CustomEditorArgs = ConstructorParameters<typeof CustomEditor>;
 
 type InternalEditor = {
@@ -37,250 +65,6 @@ type ReplaceSessionEdit = {
 };
 
 const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
-
-function clamp(value: number, min: number, max: number): number {
-	return Math.max(min, Math.min(max, value));
-}
-
-function sanitizeStatusText(text: string): string {
-	return text
-		.replace(/[\r\n\t]/g, " ")
-		.replace(/ +/g, " ")
-		.trim();
-}
-
-function formatTokens(count: number): string {
-	if (count < 1000) return count.toString();
-	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
-	if (count < 1000000) return `${Math.round(count / 1000)}k`;
-	if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
-	return `${Math.round(count / 1000000)}M`;
-}
-
-function isWord(char: string | undefined): boolean {
-	return !!char && /[A-Za-z0-9_]/.test(char);
-}
-
-function runClipboardCommand(command: string, args: readonly string[]): string | undefined {
-	try {
-		return execFileSync(command, args, {
-			encoding: "utf8",
-			stdio: ["ignore", "pipe", "ignore"],
-			timeout: 2000,
-		}).replace(/\r\n/g, "\n");
-	} catch {
-		return undefined;
-	}
-}
-
-function readSystemClipboardText(): string | undefined {
-	if (process.platform === "darwin") return runClipboardCommand("pbpaste", []);
-	if (process.platform === "win32") {
-		return runClipboardCommand("powershell", ["-NoProfile", "-Command", "Get-Clipboard -Raw"]);
-	}
-	if (process.env.TERMUX_VERSION) {
-		const text = runClipboardCommand("termux-clipboard-get", []);
-		if (text !== undefined) return text;
-	}
-	for (const [command, args] of [
-		["wl-paste", ["-n"]],
-		["xclip", ["-selection", "clipboard", "-o"]],
-		["xsel", ["--clipboard", "--output"]],
-	] as const) {
-		const text = runClipboardCommand(command, args);
-		if (text !== undefined) return text;
-	}
-	return undefined;
-}
-
-function isBigWord(char: string | undefined): boolean {
-	return !!char && !/\s/.test(char);
-}
-
-function lineStart(text: string, offset: number): number {
-	if (offset <= 0) return 0;
-	const bounded = Math.min(offset, text.length);
-	const index = text.lastIndexOf("\n", bounded - 1);
-	return index === -1 ? 0 : index + 1;
-}
-
-function lineEnd(text: string, offset: number): number {
-	const bounded = Math.min(Math.max(offset, 0), text.length);
-	const index = text.indexOf("\n", bounded);
-	return index === -1 ? text.length : index;
-}
-
-function lineLast(text: string, offset: number): number {
-	const start = lineStart(text, offset);
-	const end = lineEnd(text, offset);
-	return end > start ? end - 1 : start;
-}
-
-function prevLineStart(text: string, offset: number): number | undefined {
-	const start = lineStart(text, offset);
-	if (start === 0) return undefined;
-	return lineStart(text, start - 1);
-}
-
-function nextLineStart(text: string, offset: number): number | undefined {
-	const end = lineEnd(text, offset);
-	if (end >= text.length) return undefined;
-	return end + 1;
-}
-
-function moveUp(text: string, offset: number): number {
-	const currentStart = lineStart(text, offset);
-	const targetStart = prevLineStart(text, offset);
-	if (targetStart === undefined) return offset;
-	const targetLast = lineLast(text, targetStart);
-	const col = offset - currentStart;
-	return Math.min(targetStart + col, targetLast);
-}
-
-function moveDown(text: string, offset: number): number {
-	const currentStart = lineStart(text, offset);
-	const targetStart = nextLineStart(text, offset);
-	if (targetStart === undefined) return offset;
-	const targetLast = lineLast(text, targetStart);
-	const col = offset - currentStart;
-	return Math.min(targetStart + col, targetLast);
-}
-
-function nextWordStart(text: string, offset: number, big: boolean): number {
-	const match = big ? isBigWord : isWord;
-	let pos = offset;
-
-	if (pos < text.length && match(text[pos])) {
-		while (pos < text.length && match(text[pos])) pos++;
-	}
-	while (pos < text.length && !match(text[pos])) pos++;
-	return pos;
-}
-
-function prevWordStart(text: string, offset: number, big: boolean): number {
-	const match = big ? isBigWord : isWord;
-	let pos = offset;
-
-	while (pos > 0 && !match(text[pos - 1])) pos--;
-	while (pos > 0 && match(text[pos - 1])) pos--;
-	return pos;
-}
-
-function wordEnd(text: string, offset: number, big: boolean): number {
-	if (text.length === 0) return 0;
-
-	const match = big ? isBigWord : isWord;
-	let pos = offset;
-	if (pos >= text.length) pos = text.length - 1;
-
-	if (match(text[pos]) && (pos + 1 >= text.length || !match(text[pos + 1]))) {
-		pos++;
-	}
-
-	while (pos < text.length && !match(text[pos])) pos++;
-	if (pos >= text.length) return text.length - 1;
-
-	while (pos + 1 < text.length && match(text[pos + 1])) pos++;
-	return pos;
-}
-
-function firstNonWhitespace(text: string, offset: number): number {
-	const start = lineStart(text, offset);
-	const end = lineEnd(text, offset);
-	let pos = start;
-	while (pos < end && /\s/.test(text[pos] ?? "")) pos++;
-	return pos;
-}
-
-function isBlankLine(text: string, offset: number): boolean {
-	const start = lineStart(text, offset);
-	const end = lineEnd(text, offset);
-	return /^\s*$/.test(text.slice(start, end));
-}
-
-function paragraphForward(text: string, offset: number): number {
-	let pos = lineEnd(text, offset);
-	while (pos < text.length) {
-		pos += 1;
-		if (pos >= text.length) return lineStart(text, text.length);
-		if (!isBlankLine(text, pos) && (pos === 0 || isBlankLine(text, pos - 1))) return pos;
-		pos = lineEnd(text, pos);
-	}
-	return offset;
-}
-
-function paragraphBackward(text: string, offset: number): number {
-	let pos = lineStart(text, offset);
-	while (pos > 0) {
-		pos = lineStart(text, pos - 1);
-		if (!isBlankLine(text, pos) && (pos === 0 || isBlankLine(text, pos - 1))) return pos;
-	}
-	return 0;
-}
-
-function totalLength(lines: string[]): number {
-	if (lines.length === 0) return 0;
-	return lines.reduce((sum, line) => sum + line.length, 0) + lines.length - 1;
-}
-
-function cursorToOffset(lines: string[], cursor: Cursor): number {
-	let offset = 0;
-	for (let i = 0; i < cursor.line; i++) {
-		offset += (lines[i] ?? "").length + 1;
-	}
-	return offset + cursor.col;
-}
-
-function offsetToCursor(lines: string[], offset: number): Cursor {
-	const boundedOffset = clamp(offset, 0, totalLength(lines));
-	let remaining = boundedOffset;
-
-	for (let line = 0; line < lines.length; line++) {
-		const current = lines[line] ?? "";
-		if (remaining <= current.length) {
-			return { line, col: remaining };
-		}
-		remaining -= current.length;
-		if (line < lines.length - 1) remaining -= 1;
-	}
-
-	const lastLine = Math.max(0, lines.length - 1);
-	return { line: lastLine, col: (lines[lastLine] ?? "").length };
-}
-
-function nextGraphemeOffset(text: string, offset: number): number {
-	if (offset >= text.length) return offset;
-	for (const segment of graphemeSegmenter.segment(text.slice(offset))) {
-		return offset + segment.segment.length;
-	}
-	return Math.min(offset + 1, text.length);
-}
-
-function prevGraphemeOffset(text: string, offset: number): number {
-	if (offset <= 0) return 0;
-	let previous = 0;
-	for (const segment of graphemeSegmenter.segment(text.slice(0, offset))) {
-		previous = segment.index;
-	}
-	return previous;
-}
-
-function replaceRange(text: string, start: number, end: number, replacement = ""): string {
-	return text.slice(0, start) + replacement + text.slice(end);
-}
-
-function printableSingleGrapheme(data: string): string | undefined {
-	if (!data) return undefined;
-	let result: string | undefined;
-	let count = 0;
-	for (const segment of graphemeSegmenter.segment(data)) {
-		result = segment.segment;
-		count++;
-		if (count > 1) return undefined;
-	}
-	if (!result || /[\p{Cc}\p{Cs}]/u.test(result)) return undefined;
-	return result;
-}
 
 class VimModeEditor extends CustomEditor {
 	private mode: Mode = "insert";
