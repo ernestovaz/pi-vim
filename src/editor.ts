@@ -1,0 +1,1458 @@
+import { CustomEditor } from "@earendil-works/pi-coding-agent";
+import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import {
+	clamp,
+	cursorToOffset,
+	firstNonWhitespace,
+	isBlankLine,
+	isBigWord,
+	isWord,
+	lineEnd,
+	lineLast,
+	lineStart,
+	moveDown,
+	moveUp,
+	nextGraphemeOffset,
+	nextLineStart,
+	nextWordStart,
+	offsetToCursor,
+	paragraphBackward,
+	paragraphForward,
+	prevGraphemeOffset,
+	prevLineStart,
+	prevWordStart,
+	printableSingleGrapheme,
+	replaceRange,
+	totalLength,
+	wordEnd,
+	type Cursor,
+} from "./utils.ts";
+
+export type Mode = "normal" | "insert" | "replace" | "visual" | "visual-line";
+type Pending = "d" | "c" | "y" | "f" | "F" | "t" | "T" | "r" | undefined;
+type LastFind = { char: string; forward: boolean; till: boolean } | undefined;
+type CustomEditorArgs = ConstructorParameters<typeof CustomEditor>;
+
+type InternalEditor = {
+	state: {
+		cursorLine: number;
+		lines?: string[];
+		cursorCol?: number;
+	};
+	setCursorCol(col: number): void;
+	onChange?: (text: string) => void;
+	preferredVisualCol?: number | null;
+	historyIndex?: number;
+	lastAction?: string | null;
+	paddingX?: number;
+	scrollOffset?: number;
+	borderColor?: (text: string) => string;
+	layoutText?: (contentWidth: number) => Array<{ text: string; hasCursor: boolean; cursorPos?: number }>;
+};
+
+type EditorSnapshot = {
+	text: string;
+	cursor: Cursor;
+};
+
+type ReplaceSessionEdit = {
+	start: number;
+	inserted: string;
+	original: string;
+};
+
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+
+export class VimModeEditor extends CustomEditor {
+	private mode: Mode = "insert";
+	private pending: Pending;
+	private pendingTextObject?: "i" | "a";
+	private pendingFindOp?: { op: "d" | "c" | "y"; motion: "f" | "F" | "t" | "T"; count: number };
+	private visualAnchor?: number;
+	private flashRange?: { start: number; end: number; linewise: boolean };
+	private flashTimer?: ReturnType<typeof setTimeout>;
+	private count = "";
+	private pendingG = false;
+	private lastFind: LastFind;
+	private readonly redoStack: EditorSnapshot[] = [];
+	private readonly replaceSessionEdits: ReplaceSessionEdit[] = [];
+	private unnamedRegister = "";
+	private unnamedRegisterType: "char" | "line" = "char";
+
+	constructor(
+		tui: CustomEditorArgs[0],
+		theme: CustomEditorArgs[1],
+		keybindings: CustomEditorArgs[2],
+		private onStatusChange: (mode: Mode, pending: string) => void,
+		private onYank: (text: string) => void,
+		private getClipboardText: () => string | undefined,
+	) {
+		super(tui, theme, keybindings);
+		this.emitStatus();
+		setTimeout(() => this.updateCursorStyle(), 0);
+	}
+
+	private get editor(): InternalEditor {
+		return this as unknown as InternalEditor;
+	}
+
+	private getPendingDisplay(): string {
+		const count = this.count;
+		if (this.pendingFindOp) return `${this.pendingFindOp.op}${count}${this.pendingFindOp.motion}`;
+		if (this.pendingTextObject && this.pending) return `${this.pending}${count}${this.pendingTextObject}`;
+		if (this.pending) return `${this.pending}${count}`;
+		if (this.pendingG) return `g${count}`;
+		if (count) return count;
+		return "";
+	}
+
+	private matchesAction(data: string, action: string): boolean {
+		return (this as unknown as { keybindings: { matches(data: string, action: string): boolean } }).keybindings.matches(data, action);
+	}
+
+	private writeCursorShape(sequence: string): void {
+		try {
+			process.stdout.write(sequence);
+		} catch {}
+		try {
+			this.tui.terminal.write(sequence);
+		} catch {}
+	}
+
+	private resetTerminalCursor(): void {
+		(this.tui as unknown as { setShowHardwareCursor(enabled: boolean): void }).setShowHardwareCursor(false);
+		this.writeCursorShape("\x1b[2 q");
+	}
+
+	private usesHardwareCursor(): boolean {
+		return this.mode === "normal" || this.mode === "insert" || this.mode === "replace";
+	}
+
+	private updateCursorStyle(): void {
+		const sequence = this.mode === "replace" ? "\x1b[3 q" : this.mode === "insert" ? "\x1b[5 q" : "\x1b[2 q";
+		(this.tui as unknown as { setShowHardwareCursor(enabled: boolean): void }).setShowHardwareCursor(this.usesHardwareCursor());
+		this.writeCursorShape(sequence);
+		setTimeout(() => this.writeCursorShape(sequence), 0);
+	}
+
+	private emitStatus(): void {
+		this.onStatusChange(this.mode, this.getPendingDisplay());
+		this.updateCursorStyle();
+		this.tui.requestRender();
+	}
+
+	private clearPending(): void {
+		this.pending = undefined;
+		this.pendingTextObject = undefined;
+		this.pendingFindOp = undefined;
+		this.pendingG = false;
+		this.count = "";
+		this.emitStatus();
+	}
+
+	private getVisualRange(): { start: number; end: number; linewise: boolean } | undefined {
+		if (this.visualAnchor === undefined) return undefined;
+		const current = this.getCurrentOffset();
+		if (this.mode === "visual-line") {
+			const start = Math.min(lineStart(this.getCurrentText(), this.visualAnchor), lineStart(this.getCurrentText(), current));
+			const end = Math.max(lineEnd(this.getCurrentText(), this.visualAnchor), lineEnd(this.getCurrentText(), current));
+			return { start, end: Math.min(end + 1, this.getCurrentText().length), linewise: true };
+		}
+		return {
+			start: Math.min(this.visualAnchor, current),
+			end: Math.max(this.visualAnchor, current) + 1,
+			linewise: false,
+		};
+	}
+
+	private takeCount(defaultCount = 1): number {
+		const value = this.count ? Number.parseInt(this.count, 10) : defaultCount;
+		this.count = "";
+		return Number.isFinite(value) && value > 0 ? value : defaultCount;
+	}
+
+	private captureSnapshot(): EditorSnapshot {
+		const cursor = this.getCursor();
+		return {
+			text: this.getText(),
+			cursor: { line: cursor.line, col: cursor.col },
+		};
+	}
+
+	private restoreSnapshot(snapshot: EditorSnapshot): void {
+		this.editor.state.lines = snapshot.text.split("\n");
+		this.editor.state.cursorLine = snapshot.cursor.line;
+		this.editor.setCursorCol(snapshot.cursor.col);
+		this.editor.preferredVisualCol = null;
+		this.editor.historyIndex = -1;
+		this.editor.lastAction = null;
+		this.editor.onChange?.(snapshot.text);
+		this.tui.requestRender();
+	}
+
+	private clearRedoStack(): void {
+		this.redoStack.length = 0;
+	}
+
+	private flashSelection(start: number, end: number, linewise = false): void {
+		if (this.flashTimer) clearTimeout(this.flashTimer);
+		this.flashRange = { start: Math.min(start, end), end: Math.max(start, end), linewise };
+		this.tui.requestRender();
+		this.flashTimer = setTimeout(() => {
+			this.flashRange = undefined;
+			this.flashTimer = undefined;
+			this.tui.requestRender();
+		}, 120);
+	}
+
+	private writeRegister(text: string, type: "char" | "line" = "char"): void {
+		this.unnamedRegister = text;
+		this.unnamedRegisterType = type;
+	}
+
+	private writeYank(text: string, type: "char" | "line" = "char"): void {
+		this.writeRegister(text, type);
+		this.onYank(text);
+	}
+
+	private readClipboardRegister(): { text: string; type: "char" | "line" } | undefined {
+		const text = this.getClipboardText();
+		if (!text) return undefined;
+		return {
+			text,
+			type: text === this.unnamedRegister ? this.unnamedRegisterType : "char",
+		};
+	}
+
+	private wordObjectRange(around: boolean): { start: number; end: number } | undefined {
+		const text = this.getCurrentText();
+		let start = this.getCurrentOffset();
+		if (!isWord(text[start])) {
+			if (isWord(text[start - 1])) start -= 1;
+			else return undefined;
+		}
+		while (start > 0 && isWord(text[start - 1])) start--;
+		let end = start;
+		while (end < text.length && isWord(text[end])) end++;
+		if (around) {
+			while (end < text.length && (text[end] === " " || text[end] === "\t")) end++;
+		}
+		return { start, end };
+	}
+
+	private delimitedObjectRange(char: string, around: boolean): { start: number; end: number } | undefined {
+		const pairs: Record<string, [string, string]> = {
+			'"': ['"', '"'],
+			"'": ["'", "'"],
+			"`": ["`", "`"],
+			"(": ["(", ")"],
+			")": ["(", ")"],
+			"[": ["[", "]"],
+			"]": ["[", "]"],
+			"{": ["{", "}"],
+			"}": ["{", "}"],
+		};
+		const pair = pairs[char];
+		if (!pair) return undefined;
+		const [open, close] = pair;
+		const text = this.getCurrentText();
+		if (text.length === 0) return undefined;
+		let offset = Math.min(this.getCurrentOffset(), text.length - 1);
+
+		if (open === close) {
+			const startOfLine = lineStart(text, offset);
+			const endOfLine = lineEnd(text, offset);
+			const pairs: Array<{ start: number; end: number }> = [];
+			let pendingQuote: number | undefined;
+			for (let i = startOfLine; i < endOfLine; i++) {
+				if (text[i] !== open || text[i - 1] === "\\") continue;
+				if (pendingQuote === undefined) pendingQuote = i;
+				else {
+					pairs.push({ start: pendingQuote, end: i });
+					pendingQuote = undefined;
+				}
+			}
+			if (pairs.length === 0) return undefined;
+			const candidates = pairs.filter((pair) => offset >= pair.start && offset <= pair.end);
+			if (candidates.length > 0) {
+				const pair = candidates.reduce((best, candidate) =>
+					candidate.end - candidate.start < best.end - best.start ? candidate : best,
+				);
+				return around ? { start: pair.start, end: pair.end + 1 } : { start: pair.start + 1, end: pair.end };
+			}
+			let best: { start: number; end: number; distance: number } | undefined;
+			for (const pair of pairs) {
+				const innerStart = pair.start + 1;
+				const innerEnd = pair.end;
+				const distance = offset < innerStart ? innerStart - offset : offset > innerEnd ? offset - innerEnd : 0;
+				if (!best || distance < best.distance || (distance === best.distance && pair.start > best.start)) {
+					best = { start: pair.start, end: pair.end, distance };
+				}
+			}
+			if (!best) return undefined;
+			return around ? { start: best.start, end: best.end + 1 } : { start: best.start + 1, end: best.end };
+		}
+
+		const candidates: Array<{ start: number; end: number }> = [];
+		for (let start = 0; start < text.length; start++) {
+			if (text[start] !== open) continue;
+			let depth = 0;
+			for (let end = start + 1; end < text.length; end++) {
+				if (text[end] === open) depth++;
+				else if (text[end] === close) {
+					if (depth === 0) {
+						if (offset >= start && offset <= end) candidates.push({ start, end });
+						break;
+					}
+					depth--;
+				}
+			}
+		}
+		if (candidates.length === 0) return undefined;
+		const match = candidates.reduce((best, candidate) => {
+			if (!best) return candidate;
+			return candidate.end - candidate.start < best.end - best.start ? candidate : best;
+		}, undefined as { start: number; end: number } | undefined);
+		if (!match) return undefined;
+		return around ? { start: match.start, end: match.end + 1 } : { start: match.start + 1, end: match.end };
+	}
+
+	private setMode(mode: Mode): void {
+		if (this.mode === mode) return;
+		this.mode = mode;
+		if (mode !== "replace") this.replaceSessionEdits.length = 0;
+		if (mode !== "visual" && mode !== "visual-line") this.visualAnchor = undefined;
+		this.emitStatus();
+		this.tui.requestRender();
+	}
+
+	private getCurrentText(): string {
+		return this.getText();
+	}
+
+	private getCurrentOffset(): number {
+		return cursorToOffset(this.getLines(), this.getCursor());
+	}
+
+	private setCursor(line: number, col: number): void {
+		this.editor.state.cursorLine = line;
+		this.editor.setCursorCol(col);
+		this.tui.requestRender();
+	}
+
+	private moveToOffset(offset: number): void {
+		const cursor = offsetToCursor(this.getLines(), offset);
+		this.setCursor(cursor.line, cursor.col);
+	}
+
+	private enterVisual(linewise: boolean): void {
+		this.clearPending();
+		this.visualAnchor = this.getCurrentOffset();
+		this.setMode(linewise ? "visual-line" : "visual");
+	}
+
+	private exitVisual(): void {
+		const range = this.getVisualRange();
+		this.setMode("normal");
+		if (range) this.moveToOffset(range.start);
+	}
+
+	private applyVisual(action: "delete" | "change" | "yank" | "put"): void {
+		const range = this.getVisualRange();
+		if (!range) {
+			this.setMode("normal");
+			return;
+		}
+		const text = this.getCurrentText();
+		const selected = text.slice(range.start, range.end);
+		if (action === "yank") {
+			this.writeYank(selected, range.linewise ? "line" : "char");
+			this.setMode("normal");
+			this.moveToOffset(range.start);
+			return;
+		}
+		if (action === "put") {
+			const register = this.readClipboardRegister();
+			if (!register) {
+				this.setMode("normal");
+				return;
+			}
+			this.edit(() => ({
+				text: replaceRange(text, range.start, range.end, register.text),
+				cursorOffset: Math.max(range.start, range.start + register.text.length - 1),
+			}));
+			this.setMode("normal");
+			return;
+		}
+		this.writeYank(selected, range.linewise ? "line" : "char");
+		this.edit(() => ({
+			text: replaceRange(text, range.start, range.end),
+			cursorOffset: range.start,
+		}));
+		this.setMode(action === "change" ? "insert" : "normal");
+	}
+
+	private normalizeCursorForNormalMode(): void {
+		const cursor = this.getCursor();
+		const line = this.getLines()[cursor.line] ?? "";
+		if (line.length === 0) {
+			this.setCursor(cursor.line, 0);
+			return;
+		}
+		if (cursor.col > 0) {
+			this.setCursor(cursor.line, Math.min(cursor.col - 1, line.length - 1));
+			return;
+		}
+		this.setCursor(cursor.line, 0);
+	}
+
+	private edit(transform: (text: string, offset: number) => { text: string; cursorOffset: number } | undefined): boolean {
+		const text = this.getCurrentText();
+		const offset = this.getCurrentOffset();
+		const next = transform(text, offset);
+		if (!next) return false;
+		if (next.text === text && next.cursorOffset === offset) return false;
+
+		this.clearRedoStack();
+		this.setText(next.text);
+		const cursor = offsetToCursor(this.getLines(), next.cursorOffset);
+		this.setCursor(cursor.line, cursor.col);
+		return true;
+	}
+
+	private enterInsert(): void {
+		this.clearPending();
+		this.setMode("insert");
+	}
+
+	private enterReplace(): void {
+		this.clearPending();
+		this.replaceSessionEdits.length = 0;
+		this.setMode("replace");
+	}
+
+	private appendAfterCursor(): void {
+		const text = this.getCurrentText();
+		const offset = this.getCurrentOffset();
+		this.moveToOffset(Math.min(offset + 1, lineEnd(text, offset)));
+		this.enterInsert();
+	}
+
+	private insertLineStart(): void {
+		const text = this.getCurrentText();
+		const offset = this.getCurrentOffset();
+		this.moveToOffset(firstNonWhitespace(text, offset));
+		this.enterInsert();
+	}
+
+	private appendLineEnd(): void {
+		const text = this.getCurrentText();
+		const offset = this.getCurrentOffset();
+		this.moveToOffset(lineEnd(text, offset));
+		this.enterInsert();
+	}
+
+	private openLineBelow(): void {
+		this.clearPending();
+		this.edit((text, offset) => {
+			const at = lineEnd(text, offset);
+			return {
+				text: `${text.slice(0, at)}\n${text.slice(at)}`,
+				cursorOffset: at + 1,
+			};
+		});
+		this.setMode("insert");
+	}
+
+	private openLineAbove(): void {
+		this.clearPending();
+		this.edit((text, offset) => {
+			const at = lineStart(text, offset);
+			return {
+				text: `${text.slice(0, at)}\n${text.slice(at)}`,
+				cursorOffset: at,
+			};
+		});
+		this.setMode("insert");
+	}
+
+	private moveWord(direction: "next" | "prev" | "end", big: boolean, count = 1): void {
+		this.moveToOffset(this.wordMotionTarget(direction, big, count));
+	}
+
+	private moveLeft(count = 1): void {
+		let offset = this.getCurrentOffset();
+		const text = this.getCurrentText();
+		for (let i = 0; i < count; i++) {
+			offset = Math.max(lineStart(text, offset), prevGraphemeOffset(text, offset));
+		}
+		this.moveToOffset(offset);
+	}
+
+	private moveRight(count = 1): void {
+		let offset = this.getCurrentOffset();
+		const text = this.getCurrentText();
+		for (let i = 0; i < count; i++) {
+			offset = Math.min(lineLast(text, offset), nextGraphemeOffset(text, offset));
+		}
+		this.moveToOffset(offset);
+	}
+
+	private moveUp(count = 1): void {
+		let offset = this.getCurrentOffset();
+		for (let i = 0; i < count; i++) {
+			offset = moveUp(this.getCurrentText(), offset);
+		}
+		this.moveToOffset(offset);
+	}
+
+	private moveDown(count = 1): void {
+		let offset = this.getCurrentOffset();
+		for (let i = 0; i < count; i++) {
+			offset = moveDown(this.getCurrentText(), offset);
+		}
+		this.moveToOffset(offset);
+	}
+
+	private moveLineStart(): void {
+		this.moveToOffset(lineStart(this.getCurrentText(), this.getCurrentOffset()));
+	}
+
+	private moveLineFirstNonWhitespace(count = 1): void {
+		if (count > 1) this.moveDown(count - 1);
+		this.moveToOffset(firstNonWhitespace(this.getCurrentText(), this.getCurrentOffset()));
+	}
+
+	private moveToLine(lineNumber: number): void {
+		const lines = this.getLines();
+		const lineIndex = clamp(lineNumber - 1, 0, Math.max(0, lines.length - 1));
+		const col = Math.min(this.getCursor().col, Math.max(0, (lines[lineIndex] ?? "").length - 1));
+		this.setCursor(lineIndex, Math.max(0, col));
+	}
+
+	private moveParagraph(forward: boolean, count = 1): void {
+		let offset = this.getCurrentOffset();
+		for (let i = 0; i < count; i++) {
+			offset = forward ? paragraphForward(this.getCurrentText(), offset) : paragraphBackward(this.getCurrentText(), offset);
+		}
+		this.moveToOffset(offset);
+	}
+
+	private moveLineEnd(): void {
+		this.moveToOffset(lineLast(this.getCurrentText(), this.getCurrentOffset()));
+	}
+
+	private replaceUnderCursor(char: string, count = 1): void {
+		this.clearPending();
+		this.edit((text, offset) => {
+			if (offset >= lineEnd(text, offset)) return undefined;
+			let end = offset;
+			let replaced = 0;
+			for (let i = 0; i < count; i++) {
+				end = nextGraphemeOffset(text, end);
+				if (end > lineEnd(text, offset)) {
+					end = lineEnd(text, offset);
+					break;
+				}
+				replaced++;
+			}
+			return {
+				text: replaceRange(text, offset, end, char.repeat(Math.max(1, replaced))),
+				cursorOffset: offset,
+			};
+		});
+	}
+
+	private deleteBackwardChar(): boolean {
+		const lastReplace = this.replaceSessionEdits[this.replaceSessionEdits.length - 1];
+		if (this.mode === "replace" && lastReplace) {
+			const restored = this.edit((text, offset) => {
+				const end = lastReplace.start + lastReplace.inserted.length;
+				if (offset !== end) return undefined;
+				this.replaceSessionEdits.pop();
+				return {
+					text: replaceRange(text, lastReplace.start, end, lastReplace.original),
+					cursorOffset: lastReplace.start,
+				};
+			});
+			if (restored) return true;
+		}
+		return this.edit((text, offset) => {
+			if (offset <= 0) return undefined;
+			const start = prevGraphemeOffset(text, offset);
+			return {
+				text: replaceRange(text, start, offset),
+				cursorOffset: start,
+			};
+		});
+	}
+
+	private replaceModeInput(data: string): void {
+		if (data === "\r") {
+			super.handleInput(data);
+			return;
+		}
+		if (this.matchesAction(data, "tui.editor.deleteCharBackward") || matchesKey(data, "shift+backspace")) {
+			this.deleteBackwardChar();
+			return;
+		}
+		if (!(data.length === 1 && data.charCodeAt(0) >= 32)) {
+			super.handleInput(data);
+			return;
+		}
+		this.edit((text, offset) => {
+			if (offset < text.length && text[offset] !== "\n") {
+				const end = nextGraphemeOffset(text, offset);
+				this.replaceSessionEdits.push({
+					start: offset,
+					inserted: data,
+					original: text.slice(offset, end),
+				});
+				return {
+					text: replaceRange(text, offset, end, data),
+					cursorOffset: offset + data.length,
+				};
+			}
+			this.replaceSessionEdits.push({ start: offset, inserted: data, original: "" });
+			return {
+				text: replaceRange(text, offset, offset, data),
+				cursorOffset: offset + data.length,
+			};
+		});
+	}
+
+	private deleteToLineEnd(change: boolean): void {
+		this.clearPending();
+		this.edit((text, offset) => {
+			const end = lineEnd(text, offset);
+			if (offset > end) return undefined;
+			const deleteEnd = offset === end && end < text.length ? end + 1 : end;
+			if (deleteEnd <= offset) return undefined;
+			this.writeYank(text.slice(offset, deleteEnd), "char");
+			return {
+				text: replaceRange(text, offset, deleteEnd),
+				cursorOffset: offset,
+			};
+		});
+		if (change) this.setMode("insert");
+	}
+
+	private substituteChar(): void {
+		this.clearPending();
+		this.edit((text, offset) => {
+			if (offset >= lineEnd(text, offset)) return undefined;
+			const end = nextGraphemeOffset(text, offset);
+			this.writeYank(text.slice(offset, end), "char");
+			return {
+				text: replaceRange(text, offset, end),
+				cursorOffset: offset,
+			};
+		});
+		this.setMode("insert");
+	}
+
+	private toggleCase(count = 1): void {
+		this.clearPending();
+		this.edit((text, offset) => {
+			if (offset >= lineEnd(text, offset)) return undefined;
+			let current = offset;
+			let result = text;
+			for (let i = 0; i < count; i++) {
+				if (current >= lineEnd(result, offset)) break;
+				const end = nextGraphemeOffset(result, current);
+				const segment = result.slice(current, end);
+				const toggled = segment === segment.toUpperCase() ? segment.toLowerCase() : segment.toUpperCase();
+				result = replaceRange(result, current, end, toggled);
+				current = current + toggled.length;
+			}
+			return {
+				text: result,
+				cursorOffset: Math.max(offset, current - 1),
+			};
+		});
+	}
+
+	private deleteUnderCursor(count = 1): void {
+		this.clearPending();
+		this.edit((text, offset) => {
+			if (offset >= lineEnd(text, offset)) return undefined;
+			let end = offset;
+			for (let i = 0; i < count; i++) {
+				end = nextGraphemeOffset(text, end);
+				if (end > lineEnd(text, offset)) {
+					end = lineEnd(text, offset);
+					break;
+				}
+			}
+			this.writeYank(text.slice(offset, end), "char");
+			return {
+				text: replaceRange(text, offset, end),
+				cursorOffset: offset,
+			};
+		});
+	}
+
+	private applyRange(start: number, end: number, change = false, yank = false): void {
+		this.clearPending();
+		const from = Math.min(start, end);
+		const to = Math.max(start, end);
+		if (to <= from) return;
+		const text = this.getCurrentText();
+		const selected = text.slice(from, to);
+		if (yank) this.writeYank(selected, "char");
+		if (yank) {
+			this.flashSelection(from, to, false);
+			this.moveToOffset(start <= end ? from : Math.max(from, to - 1));
+			return;
+		}
+		this.writeYank(selected, "char");
+		this.edit(() => ({
+			text: replaceRange(text, from, to),
+			cursorOffset: from,
+		}));
+		if (change) this.setMode("insert");
+	}
+
+	private wordMotionTarget(direction: "next" | "prev" | "end", big: boolean, count: number, from = this.getCurrentOffset()): number {
+		let target = from;
+		for (let i = 0; i < count; i++) {
+			const text = this.getCurrentText();
+			target =
+				direction === "next"
+					? nextWordStart(text, target, big)
+					: direction === "prev"
+						? prevWordStart(text, target, big)
+						: wordEnd(text, target, big);
+		}
+		return target;
+	}
+
+	private deleteWord(change: boolean): void {
+		const offset = this.getCurrentOffset();
+		const endOffset = this.wordMotionTarget("next", false, this.takeCount(1), offset);
+		this.applyRange(offset, endOffset, change);
+	}
+
+	private deleteLine(count = 1, direction: -1 | 1 | 0 = 0): void {
+		this.clearPending();
+		this.edit((text, offset) => {
+			if (text.length === 0) return undefined;
+			const { start, end } = this.lineBlockRange(count, direction);
+			this.writeYank(text.slice(start, end), "line");
+			const nextText = replaceRange(text, start, end);
+			return {
+				text: nextText,
+				cursorOffset: Math.min(start, nextText.length),
+			};
+		});
+	}
+
+	private substituteLine(count = 1): void {
+		this.deleteLine(count);
+		this.setMode("insert");
+	}
+
+	private lineBlockRange(count: number, direction: -1 | 1 | 0): { start: number; end: number } {
+		const text = this.getCurrentText();
+		const offset = this.getCurrentOffset();
+		let start = lineStart(text, offset);
+		let end = lineEnd(text, offset);
+		if (direction >= 0) {
+			for (let i = 1; i < count; i++) {
+				if (end >= text.length) break;
+				end = lineEnd(text, end + 1);
+			}
+			end = Math.min(end + 1, text.length);
+		} else {
+			for (let i = 1; i < count; i++) {
+				if (start === 0) break;
+				start = lineStart(text, start - 1);
+			}
+			end = Math.min(lineEnd(text, offset) + 1, text.length);
+		}
+		return { start, end };
+	}
+
+	private yankLine(count = 1): void {
+		this.clearPending();
+		const { start, end } = this.lineBlockRange(count, 0);
+		this.writeYank(this.getCurrentText().slice(start, end), "line");
+		this.flashSelection(start, end, true);
+	}
+
+	private put(after: boolean, count = 1): void {
+		this.clearPending();
+		const register = this.readClipboardRegister();
+		if (!register) return;
+		const text = register.text.repeat(Math.max(1, count));
+		const linewise = register.type === "line";
+		this.edit((currentText, offset) => {
+			if (linewise) {
+				const currentLineEnd = lineEnd(currentText, offset);
+				const insertAt = after ? currentLineEnd + (currentLineEnd < currentText.length ? 1 : 0) : lineStart(currentText, offset);
+				const needsLeadingNewline = after && insertAt === currentText.length && currentText.length > 0 && currentText[currentText.length - 1] !== "\n";
+				const insertion = needsLeadingNewline ? `\n${text}` : text;
+				const nextText = replaceRange(currentText, insertAt, insertAt, insertion);
+				return { text: nextText, cursorOffset: insertAt + (needsLeadingNewline ? 1 : 0) };
+			}
+
+			const insertAt = after ? Math.min(nextGraphemeOffset(currentText, offset), currentText.length) : offset;
+			const nextText = replaceRange(currentText, insertAt, insertAt, text);
+			return {
+				text: nextText,
+				cursorOffset: Math.max(insertAt, insertAt + text.length - 1),
+			};
+		});
+	}
+
+	private joinLines(): void {
+		this.clearPending();
+		this.edit((text, offset) => {
+			const end = lineEnd(text, offset);
+			if (end >= text.length) return undefined;
+
+			let next = end + 1;
+			while (next < text.length && (text[next] === " " || text[next] === "\t")) next++;
+
+			const trailing = end > 0 && /[ \t]/.test(text[end - 1] ?? "");
+			const paren = next < text.length && text[next] === ")";
+			let nextText = replaceRange(text, end, next);
+			if (!trailing && !paren) {
+				nextText = replaceRange(nextText, end, end, " ");
+			}
+
+			return {
+				text: nextText,
+				cursorOffset: end,
+			};
+		});
+	}
+
+	private repeatFind(reverse = false): void {
+		if (!this.lastFind) return;
+		this.findChar(this.lastFind.char, reverse ? !this.lastFind.forward : this.lastFind.forward, this.lastFind.till);
+	}
+
+	private findCharTarget(char: string, forward: boolean, till = false): number | undefined {
+		const text = this.getCurrentText();
+		const offset = this.getCurrentOffset();
+		const start = lineStart(text, offset);
+		const end = lineEnd(text, offset);
+
+		if (forward) {
+			for (let i = offset + 1; i < end; i++) {
+				if (text[i] === char) return till ? i - 1 : i;
+			}
+			return undefined;
+		}
+
+		for (let i = offset - 1; i >= start; i--) {
+			if (text[i] === char) return till ? i + 1 : i;
+		}
+	}
+
+	private findChar(char: string, forward: boolean, till = false): void {
+		this.lastFind = { char, forward, till };
+		const target = this.findCharTarget(char, forward, till);
+		if (target !== undefined) this.moveToOffset(target);
+	}
+
+	private isInterruptKey(data: string): boolean {
+		return this.matchesAction(data, "app.interrupt") || matchesKey(data, "escape") || matchesKey(data, "ctrl+[");
+	}
+
+	private performUndo(): void {
+		const before = this.captureSnapshot();
+		super.handleInput("\x1f");
+		const after = this.captureSnapshot();
+		if (after.text !== before.text || after.cursor.line !== before.cursor.line || after.cursor.col !== before.cursor.col) {
+			this.redoStack.push(before);
+		}
+	}
+
+	private performRedo(): void {
+		const snapshot = this.redoStack.pop();
+		if (!snapshot) return;
+		this.restoreSnapshot(snapshot);
+	}
+
+	override render(width: number): string[] {
+		const range = this.getVisualRange() ?? this.flashRange;
+		if (!range) {
+			const lines = super.render(width);
+			if (!this.usesHardwareCursor()) return lines;
+            return lines.map((line) =>
+				line
+					.replace(/(\x1b_pi:c\x07)?\x1b\[7m \x1b\[0m/g, "$1 ")
+					.replace(/(\x1b_pi:c\x07)?\x1b\[7m([\s\S])\x1b\[0m/g, "$1$2"),
+			);
+		}
+
+		const editor = this.editor;
+		const paddingX = Math.min(editor.paddingX ?? 0, Math.max(0, Math.floor((width - 1) / 2)));
+		const contentWidth = Math.max(1, width - paddingX * 2);
+		const layoutWidth = Math.max(1, contentWidth - (paddingX ? 0 : 1));
+		const layout = editor.layoutText?.(layoutWidth);
+		if (!layout) return super.render(width);
+
+		const terminalRows = this.tui.terminal.rows;
+		const maxVisibleLines = Math.max(5, Math.floor(terminalRows * 0.3));
+		const selectedBg = (s: string) => `\x1b[7m${s}\x1b[0m`;
+		const horizontal = (editor.borderColor ?? ((s: string) => s))("─");
+		const leftPadding = " ".repeat(paddingX);
+		const rightPadding = leftPadding;
+		const text = this.getCurrentText();
+
+		let searchFrom = 0;
+		const mapped = layout.map((line) => {
+			const plain = line.text;
+			if (plain.length === 0) {
+				const start = Math.min(searchFrom, text.length);
+				if (text[start] === "\n") searchFrom = start + 1;
+				return { ...line, absStart: start, absEnd: start };
+			}
+			let start = text.indexOf(plain, searchFrom);
+			if (start === -1 && searchFrom > 0) start = text.indexOf(plain);
+			if (start !== -1) {
+				searchFrom = start + plain.length;
+				if (text[searchFrom] === "\n") searchFrom += 1;
+			}
+			return { ...line, absStart: start, absEnd: start === -1 ? -1 : start + plain.length };
+		});
+
+		let cursorLineIndex = mapped.findIndex((line) => line.hasCursor);
+		if (cursorLineIndex === -1) cursorLineIndex = 0;
+		editor.scrollOffset = editor.scrollOffset ?? 0;
+		if (cursorLineIndex < editor.scrollOffset) editor.scrollOffset = cursorLineIndex;
+		else if (cursorLineIndex >= editor.scrollOffset + maxVisibleLines) editor.scrollOffset = cursorLineIndex - maxVisibleLines + 1;
+		const maxScrollOffset = Math.max(0, mapped.length - maxVisibleLines);
+		editor.scrollOffset = Math.max(0, Math.min(editor.scrollOffset, maxScrollOffset));
+		const visibleLines = mapped.slice(editor.scrollOffset, editor.scrollOffset + maxVisibleLines);
+
+		const result: string[] = [];
+		if (editor.scrollOffset > 0) {
+			const indicator = `─── ↑ ${editor.scrollOffset} more `;
+			result.push(truncateToWidth((editor.borderColor ?? ((s: string) => s))(indicator + "─".repeat(Math.max(0, width - visibleWidth(indicator)))), width, ""));
+		} else {
+			result.push(truncateToWidth(horizontal.repeat(width), width, ""));
+		}
+
+		for (const line of visibleLines) {
+			let displayText = line.text;
+			if (line.absStart !== -1) {
+				const lineRangeEnd = range.linewise ? Math.max(line.absEnd, line.absStart + line.text.length, line.absEnd + 1) : line.absEnd;
+				const overlapStart = Math.max(range.start, line.absStart);
+				const overlapEnd = Math.min(range.end, lineRangeEnd);
+				if (range.linewise && overlapStart <= line.absStart && overlapEnd > line.absStart) {
+					displayText = selectedBg(displayText || " ");
+				} else if (overlapEnd > overlapStart) {
+					const localStart = overlapStart - line.absStart;
+					const localEnd = overlapEnd - line.absStart;
+					displayText = `${displayText.slice(0, localStart)}${selectedBg(displayText.slice(localStart, localEnd) || " ")}${displayText.slice(localEnd)}`;
+				}
+			}
+			let lineVisibleWidth = visibleWidth(line.text);
+			if (!this.flashRange && (this.mode !== "visual" && this.mode !== "visual-line") && line.hasCursor && line.cursorPos !== undefined) {
+				const before = displayText.slice(0, line.cursorPos);
+				const after = displayText.slice(line.cursorPos);
+				if (after.length > 0) {
+					const first = [...graphemeSegmenter.segment(after)][0]?.segment || "";
+					displayText = before + `\x1b[7m${first}\x1b[0m` + after.slice(first.length);
+				} else {
+					displayText = before + "\x1b[7m \x1b[0m";
+					lineVisibleWidth += 1;
+				}
+			}
+			const padding = " ".repeat(Math.max(0, contentWidth - lineVisibleWidth));
+			result.push(truncateToWidth(`${leftPadding}${displayText}${padding}${rightPadding}`, width, ""));
+		}
+
+		const linesBelow = mapped.length - (editor.scrollOffset + visibleLines.length);
+		if (linesBelow > 0) {
+			const indicator = `─── ↓ ${linesBelow} more `;
+			result.push(truncateToWidth((editor.borderColor ?? ((s: string) => s))(indicator + "─".repeat(Math.max(0, width - visibleWidth(indicator)))), width, ""));
+		} else {
+			result.push(truncateToWidth(horizontal.repeat(width), width, ""));
+		}
+		return result;
+	}
+
+	private applyPendingOperator(target: number, inclusive = false): boolean {
+		const offset = this.getCurrentOffset();
+		const change = this.pending === "c";
+		const yank = this.pending === "y";
+		this.applyRange(offset, inclusive ? target + 1 : target, change, yank);
+		return true;
+	}
+
+	private handlePendingFindOp(data: string): boolean {
+		if (!this.pendingFindOp || !(data.length === 1 && data.charCodeAt(0) >= 32)) return false;
+		let target: number | undefined;
+		for (let i = 0; i < this.pendingFindOp.count; i++) {
+			const next = this.findCharTarget(data, this.pendingFindOp.motion === "f" || this.pendingFindOp.motion === "t", this.pendingFindOp.motion === "t" || this.pendingFindOp.motion === "T");
+			if (next === undefined) {
+				target = undefined;
+				break;
+			}
+			target = next;
+			this.moveToOffset(next);
+		}
+		if (target === undefined) {
+			this.clearPending();
+			return true;
+		}
+		this.pending = this.pendingFindOp.op;
+		const inclusive = this.pendingFindOp.motion === "f" || this.pendingFindOp.motion === "F";
+		this.pendingFindOp = undefined;
+		return this.applyPendingOperator(target, inclusive);
+	}
+
+	private handleTextObject(data: string): boolean {
+		if (!this.pendingTextObject || !this.pending) {
+			this.clearPending();
+			return false;
+		}
+		const around = this.pendingTextObject === "a";
+		const normalized = data === ")" ? "(" : data === "]" ? "[" : data === "}" ? "{" : data;
+		const range = normalized === "w" ? this.wordObjectRange(around) : this.delimitedObjectRange(normalized, around);
+		if (!range) {
+			this.clearPending();
+			return true;
+		}
+		const change = this.pending === "c";
+		const yank = this.pending === "y";
+		this.applyRange(range.start, range.end, change, yank);
+		return true;
+	}
+
+	private handlePending(data: string): boolean {
+		if (this.isInterruptKey(data)) {
+			this.clearPending();
+			this.tui.requestRender();
+			return true;
+		}
+
+		switch (this.pending) {
+			case "r": {
+				const char = printableSingleGrapheme(data);
+				if (char) {
+					this.replaceUnderCursor(char, this.takeCount(1));
+					return true;
+				}
+				break;
+			}
+			case "y":
+			case "d":
+			case "c": {
+				if (data === "i" || data === "a") {
+					this.pendingTextObject = data;
+					this.emitStatus();
+					return true;
+				}
+				if (data === "f" || data === "F" || data === "t" || data === "T") {
+					this.pendingFindOp = { op: this.pending, motion: data, count: this.takeCount(1) };
+					this.emitStatus();
+					return true;
+				}
+				if (data === this.pending) {
+					const count = this.takeCount(1);
+					if (this.pending === "y") this.yankLine(count);
+					else if (this.pending === "d") this.deleteLine(count);
+					else this.substituteLine(count);
+					return true;
+				}
+				if (data === "w") return this.applyPendingOperator(this.wordMotionTarget("next", false, this.takeCount(1)));
+				if (data === "e") return this.applyPendingOperator(this.wordMotionTarget("end", false, this.takeCount(1)), true);
+				if (data === "b") return this.applyPendingOperator(this.wordMotionTarget("prev", false, this.takeCount(1)));
+				if (data === "W") return this.applyPendingOperator(this.wordMotionTarget("next", true, this.takeCount(1)));
+				if (data === "E") return this.applyPendingOperator(this.wordMotionTarget("end", true, this.takeCount(1)), true);
+				if (data === "B") return this.applyPendingOperator(this.wordMotionTarget("prev", true, this.takeCount(1)));
+				if (data === "$") return this.applyPendingOperator(lineEnd(this.getCurrentText(), this.getCurrentOffset()));
+				if (data === "0") return this.applyPendingOperator(lineStart(this.getCurrentText(), this.getCurrentOffset()));
+				if (data === "^") return this.applyPendingOperator(firstNonWhitespace(this.getCurrentText(), this.getCurrentOffset()));
+				if (data === "_") {
+					const count = this.takeCount(1);
+					if (this.pending === "y") this.yankLine(count);
+					else if (this.pending === "d") this.deleteLine(count);
+					else this.substituteLine(count);
+					return true;
+				}
+				if (data === "G") {
+					const offset = this.getCurrentOffset();
+					const start = lineStart(this.getCurrentText(), offset);
+					const end = this.getCurrentText().length;
+					const pending = this.pending;
+					this.clearPending();
+					const selected = this.getCurrentText().slice(start, end);
+					this.writeYank(selected, "line");
+					if (pending === "y") return true;
+					this.edit(() => ({ text: replaceRange(this.getCurrentText(), start, end), cursorOffset: start }));
+					if (pending === "c") this.setMode("insert");
+					return true;
+				}
+				if (data === "j") {
+					const count = this.takeCount(1);
+					if (this.pending === "y") this.yankLine(count + 1);
+					else if (this.pending === "d") this.deleteLine(count + 1, 1);
+					else this.substituteLine(count + 1);
+					return true;
+				}
+				if (data === "k") {
+					const count = this.takeCount(1);
+					if (this.pending === "y") {
+						const { start, end } = this.lineBlockRange(count + 1, -1);
+						this.writeYank(this.getCurrentText().slice(start, end), "line");
+						this.clearPending();
+					} else if (this.pending === "d") this.deleteLine(count + 1, -1);
+					else this.deleteLine(count + 1, -1), this.setMode("insert");
+					return true;
+				}
+				break;
+			}
+			case "f":
+			case "F":
+			case "t":
+			case "T": {
+				if (data.length === 1 && data.charCodeAt(0) >= 32) {
+					const forward = this.pending === "f" || this.pending === "t";
+					const till = this.pending === "t" || this.pending === "T";
+					if (this.pendingTextObject) {
+						this.clearPending();
+						return true;
+					}
+					if (this.pending === "f" || this.pending === "F" || this.pending === "t" || this.pending === "T") {
+						this.findChar(data, forward, till);
+						this.clearPending();
+						return true;
+					}
+				}
+				break;
+			}
+			default:
+				return false;
+		}
+
+		const printable = data.length === 1 && data.charCodeAt(0) >= 32;
+		this.clearPending();
+		return printable;
+	}
+
+	handleInput(data: string): void {
+		if (this.matchesAction(data, "app.editor.external")) {
+			this.resetTerminalCursor();
+			super.handleInput(data);
+			setTimeout(() => this.updateCursorStyle(), 0);
+			return;
+		}
+
+		if (this.isInterruptKey(data)) {
+			if (this.mode === "visual" || this.mode === "visual-line") {
+				this.exitVisual();
+			} else if (this.mode === "insert" || this.mode === "replace") {
+				if (this.isShowingAutocomplete()) {
+					super.handleInput(data);
+				}
+				this.clearPending();
+				this.normalizeCursorForNormalMode();
+				this.setMode("normal");
+			} else if (this.pending || this.pendingTextObject || this.pendingFindOp || this.pendingG || this.count) {
+				this.clearPending();
+				this.tui.requestRender();
+			} else {
+				super.handleInput(data);
+			}
+			return;
+		}
+
+		if (this.mode === "insert" || this.mode === "replace") {
+			if (this.mode === "insert" && (matchesKey(data, Key.shiftAlt("a")) || data === "\x1bA")) {
+				this.moveToOffset(lineEnd(this.getCurrentText(), this.getCurrentOffset()));
+				return;
+			}
+			if (this.mode === "insert" && (matchesKey(data, Key.shiftAlt("i")) || data === "\x1bI")) {
+				this.moveToOffset(lineStart(this.getCurrentText(), this.getCurrentOffset()));
+				return;
+			}
+			if (this.mode === "insert" && (matchesKey(data, Key.alt("o")) || data === "\x1bo")) {
+				this.openLineBelow();
+				return;
+			}
+			if (this.mode === "insert" && (matchesKey(data, Key.shiftAlt("o")) || data === "\x1bO")) {
+				this.openLineAbove();
+				return;
+			}
+			if (this.mode === "replace") {
+				this.replaceModeInput(data);
+				return;
+			}
+			super.handleInput(data);
+			return;
+		}
+
+		if (this.mode === "visual" || this.mode === "visual-line") {
+			if (this.matchesAction(data, "tui.input.copy")) {
+				this.applyVisual("yank");
+				return;
+			}
+			switch (data) {
+				case "v":
+					if (this.mode === "visual") this.exitVisual();
+					else this.enterVisual(false);
+					return;
+				case "V":
+					if (this.mode === "visual-line") this.exitVisual();
+					else this.enterVisual(true);
+					return;
+				case "d":
+				case "x":
+					this.applyVisual("delete");
+					return;
+				case "c":
+					this.applyVisual("change");
+					return;
+				case "y":
+					this.applyVisual("yank");
+					return;
+				case "p":
+				case "P":
+					this.applyVisual("put");
+					return;
+			}
+		}
+
+		if (this.pending && data >= "0" && data <= "9") {
+			if (this.count.length < 5) this.count += data;
+			if (this.count.length >= 5) {
+				this.clearPending();
+				return;
+			}
+			this.emitStatus();
+			return;
+		}
+
+		if ((this.pending === "d" || this.pending === "c" || this.pending === "y") && (data === "i" || data === "a")) {
+			this.pendingTextObject = data;
+			this.emitStatus();
+			return;
+		}
+		if (this.pendingTextObject && (data === '"' || data === "'" || data === "`" || data === "(" || data === ")" || data === "[" || data === "]" || data === "{" || data === "}" || data === "w")) {
+			this.handleTextObject(data);
+			return;
+		}
+
+
+		if (this.pendingFindOp) {
+			if (this.handlePendingFindOp(data)) return;
+		}
+
+		if (this.pendingTextObject) {
+			if (this.handleTextObject(data)) return;
+		}
+
+		if (this.pending && this.handlePending(data)) {
+			return;
+		}
+
+		if (this.pendingG) {
+			if (data === "g") {
+				const count = this.takeCount(1);
+				this.pendingG = false;
+				this.emitStatus();
+				this.moveToLine(count);
+				return;
+			}
+			this.pendingG = false;
+			this.emitStatus();
+		}
+
+		if (data >= "0" && data <= "9" && (data !== "0" || this.count.length > 0)) {
+			if (this.count.length < 5) this.count += data;
+			if (this.count.length >= 5) {
+				this.clearPending();
+				return;
+			}
+			this.emitStatus();
+			return;
+		}
+
+		switch (data) {
+			case "v":
+				this.enterVisual(false);
+				return;
+			case "V":
+				this.enterVisual(true);
+				return;
+			case "u":
+			case "\x1f": {
+				const count = this.takeCount(1);
+				for (let i = 0; i < count; i++) this.performUndo();
+				return;
+			}
+			case "\x12": {
+				const count = this.takeCount(1);
+				for (let i = 0; i < count; i++) this.performRedo();
+				return;
+			}
+			case "I":
+				this.insertLineStart();
+				return;
+			case "A":
+				this.appendLineEnd();
+				return;
+			case "h":
+				this.moveLeft(this.takeCount(1));
+				return;
+			case "j":
+				this.moveDown(this.takeCount(1));
+				return;
+			case "k":
+				this.moveUp(this.takeCount(1));
+				return;
+			case "l":
+				this.moveRight(this.takeCount(1));
+				return;
+			case "w":
+				this.moveWord("next", false, this.takeCount(1));
+				return;
+			case "b":
+				this.moveWord("prev", false, this.takeCount(1));
+				return;
+			case "e":
+				this.moveWord("end", false, this.takeCount(1));
+				return;
+			case "W":
+				this.moveWord("next", true, this.takeCount(1));
+				return;
+			case "B":
+				this.moveWord("prev", true, this.takeCount(1));
+				return;
+			case "E":
+				this.moveWord("end", true, this.takeCount(1));
+				return;
+			case "0":
+				this.moveLineStart();
+				this.count = "";
+				return;
+			case "^":
+				this.moveLineFirstNonWhitespace();
+				this.count = "";
+				return;
+			case "_":
+				this.moveLineFirstNonWhitespace(this.takeCount(1));
+				return;
+			case "$":
+				this.moveLineEnd();
+				this.count = "";
+				return;
+			case "g":
+				this.pendingG = true;
+				this.emitStatus();
+				return;
+			case "G":
+				this.moveToLine(this.takeCount(this.getLines().length));
+				return;
+			case "{":
+				this.moveParagraph(false, this.takeCount(1));
+				return;
+			case "}":
+				this.moveParagraph(true, this.takeCount(1));
+				return;
+			case "o":
+				this.openLineBelow();
+				return;
+			case "O":
+				this.openLineAbove();
+				return;
+			case "x":
+				this.deleteUnderCursor(this.takeCount(1));
+				return;
+			case "~":
+				this.toggleCase(this.takeCount(1));
+				return;
+			case "s":
+				this.substituteChar();
+				return;
+			case "D":
+				this.deleteToLineEnd(false);
+				return;
+			case "C":
+				this.deleteToLineEnd(true);
+				return;
+			case "r":
+				this.pending = "r";
+				this.emitStatus();
+				return;
+			case "R":
+				this.enterReplace();
+				return;
+			case "p":
+				this.put(true, this.takeCount(1));
+				return;
+			case "P":
+				this.put(false, this.takeCount(1));
+				return;
+			case "Y":
+				this.yankLine(this.takeCount(1));
+				return;
+			case ";":
+				this.repeatFind(false);
+				return;
+			case ",":
+				this.repeatFind(true);
+				return;
+			case "J":
+				this.joinLines();
+				return;
+			case "S":
+				this.substituteLine(this.takeCount(1));
+				return;
+			case "d":
+				this.pending = "d";
+				this.emitStatus();
+				return;
+			case "c":
+				this.pending = "c";
+				this.emitStatus();
+				return;
+			case "y":
+				this.pending = "y";
+				this.emitStatus();
+				return;
+			case "i":
+				if (this.pending === "d" || this.pending === "c" || this.pending === "y") {
+					this.pendingTextObject = "i";
+					return;
+				}
+				this.enterInsert();
+				return;
+			case "a":
+				if (this.pending === "d" || this.pending === "c" || this.pending === "y") {
+					this.pendingTextObject = "a";
+					return;
+				}
+				this.appendAfterCursor();
+				return;
+			case "f":
+				this.pending = "f";
+				this.emitStatus();
+				return;
+			case "F":
+				this.pending = "F";
+				this.emitStatus();
+				return;
+			case "t":
+				this.pending = "t";
+				this.emitStatus();
+				return;
+			case "T":
+				this.pending = "T";
+				this.emitStatus();
+				return;
+		}
+
+		if (data.length === 1 && data.charCodeAt(0) >= 32) return;
+		if (this.count || this.pendingG || this.pendingTextObject || this.pendingFindOp || this.pending) this.clearPending();
+		super.handleInput(data);
+	}
+}
