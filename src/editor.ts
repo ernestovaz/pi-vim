@@ -1453,6 +1453,12 @@ export class VimModeEditor extends CustomEditor {
 				this.pending = "T";
 				this.emitStatus();
 				return;
+			case ":":
+				if (this.getCurrentText().length === 0) {
+					this.enterInsert();
+					super.handleInput("/");
+				}
+				return;
 		}
 
 		if (data.length === 1 && data.charCodeAt(0) >= 32) return;
