@@ -20,7 +20,8 @@
     "url": "https://github.com/leohenon/pi-vim/issues"
   },
   "scripts": {
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/**/*.test.ts"
   },
   "files": [
     "index.ts",
